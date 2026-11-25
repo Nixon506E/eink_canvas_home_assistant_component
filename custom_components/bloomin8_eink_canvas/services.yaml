@@ -161,6 +161,42 @@ upload_image_url:
       default: true
       selector:
         boolean: {}
+    enhance:
+      name: Auto Enhance
+      description: Automatically calculate optimal brightness, contrast, and saturation from the image histogram
+      required: false
+      default: false
+      selector:
+        boolean: {}
+    dither:
+      name: Dithering Algorithm
+      description: Dither locally using the calibrated panel palette and upload via the raw pre-dithered API
+      required: false
+      selector:
+        select:
+          options:
+            - label: Burkes
+              value: burkes
+            - label: Floyd-Steinberg
+              value: floyd_steinberg
+            - label: Atkinson
+              value: atkinson
+            - label: Stucki
+              value: stucki
+            - label: Sierra
+              value: sierra
+            - label: Two-Row Sierra
+              value: two_row_sierra
+            - label: Sierra Lite
+              value: sierra_lite
+            - label: Jarvis-Judice-Ninke
+              value: jarvis_judice_ninke
+            - label: Bayer 2x2
+              value: bayer2x2
+            - label: Bayer 4x4
+              value: bayer4x4
+            - label: Bayer 8x8
+              value: bayer8x8
 
 upload_image_data:
   name: Upload Image Data (Base64)
@@ -212,6 +248,42 @@ upload_image_data:
       default: true
       selector:
         boolean: {}
+    enhance:
+      name: Auto Enhance
+      description: Automatically calculate optimal brightness, contrast, and saturation from the image histogram
+      required: false
+      default: false
+      selector:
+        boolean: {}
+    dither:
+      name: Dithering Algorithm
+      description: Dither locally using the calibrated panel palette and upload via the raw pre-dithered API.
+      required: false
+      selector:
+        select:
+          options:
+            - label: Burkes
+              value: burkes
+            - label: Floyd-Steinberg
+              value: floyd_steinberg
+            - label: Atkinson
+              value: atkinson
+            - label: Stucki
+              value: stucki
+            - label: Sierra
+              value: sierra
+            - label: Two-Row Sierra
+              value: two_row_sierra
+            - label: Sierra Lite
+              value: sierra_lite
+            - label: Jarvis-Judice-Ninke
+              value: jarvis_judice_ninke
+            - label: Bayer 2x2
+              value: bayer2x2
+            - label: Bayer 4x4
+              value: bayer4x4
+            - label: Bayer 8x8
+              value: bayer8x8
 
 upload_images_multi:
   name: Upload Multiple Images (Batch)
@@ -256,6 +328,12 @@ upload_images_multi:
       description: Resize/crop each image to the device resolution using the integration settings
       required: false
       default: true
+      selector:
+        boolean: {}
+    enhance:
+      name: Auto Enhance
+      description: Automatically calculate optimal brightness, contrast, and saturation from the image histogram
+      default: false
       selector:
         boolean: {}
 
