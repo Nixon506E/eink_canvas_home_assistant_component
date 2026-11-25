@@ -13,7 +13,9 @@ import voluptuous as vol
 from datetime import datetime
 from typing import Any, Callable, TypeAlias
 
-from PIL import Image
+from PIL import Image, ImageEnhance
+import dithering
+import numpy as np
 import async_timeout
 
 from homeassistant.config_entries import ConfigEntry
@@ -48,6 +50,10 @@ from .const import (
     ATTR_DEVICE_ID,
     ATTR_ENTITY_ID,
     SERVICE_NAMES,
+    DITHER_METHODS,
+    PANEL_PALETTES,
+    PALETTE_SPECTRA6_TUPLES,
+    PALETTE_SPECTRA6_INDICES,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -444,6 +450,132 @@ def _process_with_orientation(
 
     return processed
 
+def _auto_detect_enhancements(image: Image.Image) -> tuple[float, float, float]:
+    """Analyze image luminance, dynamic range, and saturation to compute e-ink multipliers."""
+    arr = np.asarray(image, dtype=np.float32)
+
+    # 1. Perceptual luminance (Rec. 709)
+    lum = 0.2126 * arr[:, :, 0] + 0.7152 * arr[:, :, 1] + 0.0722 * arr[:, :, 2]
+    mean_lum = float(np.mean(lum))
+
+    # Target midtone ~125 for reflective e-ink; never darken already-bright images
+    if mean_lum < 120.0 and mean_lum > 5.0:
+        brightness = min(1.45, max(1.0, 125.0 / mean_lum))
+    else:
+        brightness = 1.0
+
+    # 2. Contrast via 5th-95th percentile spread (ignores outlier specular pixels)
+    p5, p95 = np.percentile(lum, (5, 95))
+    spread = float(p95 - p5)
+    if spread < 180.0 and spread > 20.0:
+        contrast = min(1.30, max(1.0, 185.0 / spread))
+    else:
+        contrast = 1.0
+
+    # 3. Gamut / Saturation via HSV 'S' channel (0..255)
+    hsv = np.asarray(image.convert("HSV"), dtype=np.float32)
+    mean_sat = float(np.mean(hsv[:, :, 1]))
+    if mean_sat < 110.0:
+        # Boost muted photos up to 1.25x; leave vivid images at 1.0x
+        saturation = min(1.25, max(1.05, 115.0 / max(mean_sat, 40.0)))
+    else:
+        saturation = 1.0
+
+    return round(brightness, 2), round(contrast, 2), round(saturation, 2)
+
+
+def _pack_rgb_to_4bit(
+    dithered_rgb: Image.Image,
+    palette_tuples: list[tuple[int, int, int]],
+    hw_indices: tuple[int, ...],
+) -> bytes:
+    """Map dithered RGB pixels to hardware indices (0x1..0xE) and pack 2 pixels/byte."""
+    arr = np.asarray(dithered_rgb, dtype=np.uint32)
+    packed_rgb = (arr[:, :, 0] << 16) | (arr[:, :, 1] << 8) | arr[:, :, 2]
+
+    pal_keys = np.array([(r << 16) | (g << 8) | b for r, g, b in palette_tuples], dtype=np.uint32)
+    pal_vals = np.array(hw_indices, dtype=np.uint8)
+
+    order = np.argsort(pal_keys)
+    sorted_keys = pal_keys[order]
+    sorted_vals = pal_vals[order]
+
+    flat_pixels = packed_rgb.ravel()
+    pos = np.searchsorted(sorted_keys, flat_pixels)
+    mapped = sorted_vals[pos]
+
+    packed_4bit = (mapped[0::2] << 4) | mapped[1::2]
+    return packed_4bit.tobytes()
+
+
+async def _prepare_upload_payload(
+    hass: HomeAssistant,
+    entry: EinkCanvasConfigEntry,
+    raw: bytes,
+    *,
+    process: bool,
+    screen_width: int,
+    screen_height: int,
+    enhance: bool = False,
+    dither: str | None = None,
+) -> bytes:
+    """Decode, optionally resize/enhance, and return JPEG or 4-bit dithered bytes."""
+    orientation = entry.data.get(CONF_ORIENTATION, DEFAULT_ORIENTATION)
+    fill_mode = entry.data.get(CONF_FILL_MODE, DEFAULT_FILL_MODE)
+    contain_color = entry.data.get(CONF_CONTAIN_COLOR, DEFAULT_CONTAIN_COLOR)
+
+    def _work() -> bytes:
+        try:
+            image = Image.open(BytesIO(raw))
+        except Exception as err:
+            head_hex = raw[:32].hex()
+            raise ValueError(
+                f"Input is not a supported image (len={len(raw)}, head_hex={head_hex}). "
+                "Provide base64 of an actual PNG/JPEG/WebP/etc., or use upload_dithered_image_data for raw data."
+            ) from err
+
+        image = _convert_to_rgb(image)
+
+        if process or dither:
+            image = _process_with_orientation(
+                image,
+                screen_width,
+                screen_height,
+                orientation,
+                fill_mode,
+                contain_color,
+            )
+
+        if enhance:
+            brightness, contrast, saturation = _auto_detect_enhancements(image)
+            if brightness != 1.0:
+                image = ImageEnhance.Brightness(image).enhance(brightness)
+            if contrast != 1.0:
+                image = ImageEnhance.Contrast(image).enhance(contrast)
+            if saturation != 1.0:
+                image = ImageEnhance.Color(image).enhance(saturation)
+
+        if dither:
+            method = str(dither).strip().lower()
+            panel_key = (min(screen_width, screen_height), max(screen_width, screen_height))
+            palette_tuples, hw_indices = PANEL_PALETTES.get(
+                panel_key, (PALETTE_SPECTRA6_TUPLES, PALETTE_SPECTRA6_INDICES)
+            )
+            dithered_img = dithering.dither(
+                image,
+                method=method,
+                palette=palette_tuples,
+                serpentine=True,
+                linear=True,
+            )
+            return _pack_rgb_to_4bit(dithered_img, palette_tuples, hw_indices)
+
+        out = BytesIO()
+        image.save(out, format="JPEG", quality=95)
+        return out.getvalue()
+
+    return await hass.async_add_executor_job(_work)
+
 
 def _snap_to_supported_sizes(width: int, height: int) -> tuple[int, int]:
     """Snap (width,height) to known panel sizes."""
@@ -453,7 +585,9 @@ def _snap_to_supported_sizes(width: int, height: int) -> tuple[int, int]:
         return 1200, 1600
     if max(w, h) <= 900:
         return 480, 800
-    return 1200, 1600
+    if max(w, h) <= 2000:
+        return 1200, 1600
+    return 2160, 3060
 
 
 # ---------------------------------------------------------------------------
@@ -534,46 +668,6 @@ def _register_services(hass: HomeAssistant) -> None:
             height = int(device_info.get("height", 1600) or 1600)
             return _snap_to_supported_sizes(width, height)
         return _snap_to_supported_sizes(1200, 1600)
-
-    async def _to_jpeg_bytes(
-        hass: HomeAssistant,
-        entry: EinkCanvasConfigEntry,
-        raw: bytes,
-        *,
-        process: bool,
-        screen_width: int,
-        screen_height: int,
-    ) -> bytes:
-        """Convert incoming bytes to JPEG (optionally resize/crop)."""
-        orientation = entry.data.get(CONF_ORIENTATION, DEFAULT_ORIENTATION)
-        fill_mode = entry.data.get(CONF_FILL_MODE, DEFAULT_FILL_MODE)
-        contain_color = entry.data.get(CONF_CONTAIN_COLOR, DEFAULT_CONTAIN_COLOR)
-
-        def _work() -> bytes:
-            try:
-                image = Image.open(BytesIO(raw))
-            except Exception as err:
-                head = raw[:32]
-                head_hex = head.hex()
-                raise ValueError(
-                    f"Input is not a supported image (len={len(raw)}, head_hex={head_hex}). "
-                    "Provide base64 of an actual PNG/JPEG/WebP/etc., or use upload_dithered_image_data for raw data."
-                ) from err
-            image = _convert_to_rgb(image)
-            if process:
-                image = _process_with_orientation(
-                    image,
-                    screen_width,
-                    screen_height,
-                    orientation,
-                    fill_mode,
-                    contain_color,
-                )
-            out = BytesIO()
-            image.save(out, format="JPEG", quality=95)
-            return out.getvalue()
-
-        return await hass.async_add_executor_job(_work)
 
     # ---------------------------------------------------------------------------
     # Service handlers (iterate over targeted entries)
@@ -704,6 +798,8 @@ def _register_services(hass: HomeAssistant) -> None:
         safe_filename = _sanitize_filename(filename)
         show_now = bool(call.data.get("show_now", True))
         process = bool(call.data.get("process", True))
+        enhance = bool(call.data.get("enhance", False))
+        dither = call.data.get("dither")
 
         for entry in entries:
             runtime_data = _get_runtime_data(hass, entry)
@@ -712,13 +808,30 @@ def _register_services(hass: HomeAssistant) -> None:
             try:
                 raw = await _download_bytes(hass, url)
                 screen_w, screen_h = await _get_screen_resolution(hass, entry)
-                jpeg = await _to_jpeg_bytes(hass, entry, raw, process=process, screen_width=screen_w, screen_height=screen_h)
-                uploaded_path = await runtime_data.api_client.upload_image(
-                    jpeg,
-                    safe_filename,
-                    gallery=gallery,
-                    show_now=show_now,
+                payload = await _prepare_upload_payload(
+                    hass,
+                    entry,
+                    raw,
+                    process=process,
+                    screen_width=screen_w,
+                    screen_height=screen_h,
+                    brightness=brightness,
+                    contrast=contrast,
+                    saturation=saturation,
+                    dither=dither,
                 )
+                if dither:
+                    uploaded_path = await runtime_data.api_client.upload_dithered_image(
+                        payload,
+                        safe_filename,
+                    )
+                else:
+                    uploaded_path = await runtime_data.api_client.upload_image(
+                        payload,
+                        safe_filename,
+                        gallery=gallery,
+                        show_now=show_now,
+                    )
                 if uploaded_path:
                     add_log(hass, entry, f"Uploaded image from URL to {uploaded_path}")
                     device_info = await runtime_data.api_client.get_device_info(wake=True)
@@ -739,6 +852,9 @@ def _register_services(hass: HomeAssistant) -> None:
         gallery = call.data.get("gallery", "default")
         override = bool(call.data.get("override", False))
         process = bool(call.data.get("process", True))
+        brightness = float(call.data.get("brightness", 1.0))
+        contrast = float(call.data.get("contrast", 1.0))
+        saturation = float(call.data.get("saturation", 1.0))
         images_in = call.data.get("images")
 
         if not images_in:
@@ -792,7 +908,18 @@ def _register_services(hass: HomeAssistant) -> None:
                         add_log(hass, entry, f"upload_images_multi: item #{idx} missing 'url' or 'image_data'", "warning")
                         continue
 
-                    jpeg = await _to_jpeg_bytes(hass, entry, raw, process=process, screen_width=screen_w, screen_height=screen_h)
+                    jpeg = await _prepare_upload_payload(
+                        hass,
+                        entry,
+                        raw,
+                        process=process,
+                        screen_width=screen_w,
+                        screen_height=screen_h,
+                        brightness=brightness,
+                        contrast=contrast,
+                        saturation=saturation,
+                        dither=None,
+                    )
                     prepared.append((safe_item_filename, jpeg))
                 except Exception as err:
                     skipped += 1
@@ -861,6 +988,8 @@ def _register_services(hass: HomeAssistant) -> None:
         safe_filename = _sanitize_filename(filename)
         show_now = bool(call.data.get("show_now", True))
         process = bool(call.data.get("process", True))
+        enhance = bool(call.data.get("enhance", False))
+        dither = call.data.get("dither")
 
         for entry in entries:
             runtime_data = _get_runtime_data(hass, entry)
@@ -875,13 +1004,30 @@ def _register_services(hass: HomeAssistant) -> None:
 
             try:
                 screen_w, screen_h = await _get_screen_resolution(hass, entry)
-                jpeg = await _to_jpeg_bytes(hass, entry, raw, process=process, screen_width=screen_w, screen_height=screen_h)
-                uploaded_path = await runtime_data.api_client.upload_image(
-                    jpeg,
-                    safe_filename,
-                    gallery=gallery,
-                    show_now=show_now,
+                payload = await _prepare_upload_payload(
+                    hass,
+                    entry,
+                    raw,
+                    process=process,
+                    screen_width=screen_w,
+                    screen_height=screen_h,
+                    brightness=brightness,
+                    contrast=contrast,
+                    saturation=saturation,
+                    dither=dither,
                 )
+                if dither:
+                    uploaded_path = await runtime_data.api_client.upload_dithered_image(
+                        payload,
+                        safe_filename,
+                    )
+                else:
+                    uploaded_path = await runtime_data.api_client.upload_image(
+                        payload,
+                        safe_filename,
+                        gallery=gallery,
+                        show_now=show_now,
+                    )
                 if uploaded_path:
                     add_log(hass, entry, f"Uploaded image data to {uploaded_path}")
                     device_info = await runtime_data.api_client.get_device_info(wake=True)
@@ -1068,6 +1214,12 @@ def _register_services(hass: HomeAssistant) -> None:
                 vol.Optional("gallery", default="default"): cv.string,
                 vol.Optional("show_now", default=True): cv.boolean,
                 vol.Optional("process", default=True): cv.boolean,
+                vol.Optional("enhance", default=False): cv.boolean,
+                vol.Optional("dither"): vol.All(
+                    str,
+                    vol.Upper,
+                    vol.In(DITHER_METHODS),
+                 ),
             },
             None,
         ),
@@ -1080,6 +1232,12 @@ def _register_services(hass: HomeAssistant) -> None:
                 vol.Optional("gallery", default="default"): cv.string,
                 vol.Optional("show_now", default=True): cv.boolean,
                 vol.Optional("process", default=True): cv.boolean,
+                vol.Optional("enhance", default=False): cv.boolean,
+                vol.Optional("dither"): vol.All(
+                    str,
+                    vol.Upper,
+                    vol.In(DITHER_METHODS),
+                 ),
             },
             None,
         ),
@@ -1091,6 +1249,7 @@ def _register_services(hass: HomeAssistant) -> None:
                 vol.Optional("gallery", default="default"): cv.string,
                 vol.Optional("override", default=False): cv.boolean,
                 vol.Optional("process", default=True): cv.boolean,
+                vol.Optional("enhance", default=False): cv.boolean,
             },
             None,
         ),
