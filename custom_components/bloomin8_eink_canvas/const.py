@@ -39,6 +39,65 @@ DEFAULT_NAME = "BLOOMIN8 Canvas"  # Default name for the device
 #   28.5" Canvas: 2160x3060
 SUPPORTED_FORMATS = ["JPEG", "JPG", "PNG", "GIF", "BMP", "WEBP"]  # Supported input image formats that will be converted to JPEG
 
+# Supported local dithering algorithms (via Rust `dithering` library)
+DITHER_METHODS: tuple[str, ...] = (
+    "floyd_steinberg",
+    "burkes",
+    "atkinson",
+    "stucki",
+    "sierra",
+    "two_row_sierra",
+    "sierra_lite",
+    "jarvis_judice_ninke",
+    "bayer2x2",
+    "bayer4x4",
+    "bayer8x8",
+)
+
+# Standard 6-color Spectra 6 palette for 7.3" (480x800) and 13.3" (1200x1600) models
+PALETTE_SPECTRA6_INDICES: tuple[int, ...] = (
+    0x1, 0x2, 0x3, 0x4, 0x6, 0x7,
+)
+
+PALETTE_SPECTRA6_TUPLES: list[tuple[int, int, int]] = [
+    (25, 30, 33),     # 0x1: Black
+    (232, 232, 232),  # 0x2: White
+    (239, 222, 68),   # 0x3: Yellow
+    (178, 19, 24),    # 0x4: Red
+    (33, 87, 186),    # 0x6: Blue
+    (23, 95, 56),     # 0x7: Green
+]
+
+# Extended 14-color palette for the 28.5" (2160x3060) model
+PALETTE_28_5_INDICES: tuple[int, ...] = (
+    0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7,
+    0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE,
+)
+
+PALETTE_28_5_TUPLES: list[tuple[int, int, int]] = [
+    (25, 30, 33),     # 0x1: Black
+    (232, 232, 232),  # 0x2: White
+    (239, 222, 68),   # 0x3: Yellow
+    (178, 19, 24),    # 0x4: Red
+    (214, 118, 38),   # 0x5: Orange
+    (33, 87, 186),    # 0x6: Blue
+    (23, 95, 56),     # 0x7: Green
+    (42, 165, 185),   # 0x8: Cyan
+    (136, 178, 52),   # 0x9: Yellow-green
+    (26, 128, 122),   # 0xA: Teal
+    (22, 48, 118),    # 0xB: Dark blue
+    (118, 168, 224),  # 0xC: Light blue
+    (112, 48, 138),   # 0xD: Purple
+    (215, 115, 138),  # 0xE: Pink
+]
+
+# Map snapped panel dimensions (width, height) -> (RGB tuples, hardware indices)
+PANEL_PALETTES: dict[tuple[int, int], tuple[list[tuple[int, int, int]], tuple[int, ...]]] = {
+    (480, 800): (PALETTE_SPECTRA6_TUPLES, PALETTE_SPECTRA6_INDICES),     # 7.3"
+    (1200, 1600): (PALETTE_SPECTRA6_TUPLES, PALETTE_SPECTRA6_INDICES),   # 13.3"
+    (2160, 3060): (PALETTE_28_5_TUPLES, PALETTE_28_5_INDICES),           # 28.5"
+}
+
 # Configuration
 CONF_NAME = "name"
 CONF_ORIENTATION = "orientation"
